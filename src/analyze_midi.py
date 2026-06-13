@@ -217,7 +217,7 @@ def analyze_file(midi_path: Path) -> None:
 
 def run_batch(midi_dir: Path) -> None:
     """Analyze all MIDI files in midi_dir that lack a matching .txt result."""
-    all_midi = sorted({f.stem.lower(): f for f in midi_dir.glob("*") if f.suffix.lower() == ".mid"}.values())
+    all_midi = sorted({f.name.lower(): f for f in midi_dir.glob("*") if f.suffix.lower() in (".mid", ".midi")}.values())
     pending = [f for f in all_midi if not f.with_suffix(".txt").exists()]
 
     if not pending:
