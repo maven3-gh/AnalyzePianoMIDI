@@ -1,139 +1,228 @@
-"""Piano MIDI analysis using mido and pretty_midi."""
+"""Piano MIDI group-histogram analysis at 1 ms resolution.
+
+Groups the 88 piano keys (MIDI 21-108) into 7 bands and builds a
+histogram per group: how many 1-ms time slots had N notes sounding
+simultaneously.
+"""
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from collections import defaultdict
 from pathlib import Path
 
-import mido
 import pretty_midi
-import numpy as np
+
+# ---------------------------------------------------------------------------
+# Key groupings — (first_key, last_key) in 1-indexed piano-key numbering.
+# Piano key N  ↔  MIDI note (N + 20).   Key 1 = A0 = MIDI 21.
+# ---------------------------------------------------------------------------
+GROUPS: list[tuple[int, int]] = [
+    (1,  13),   # keys  1-13  → MIDI 21-33  (A0  – A1)
+    (14, 26),   # keys 14-26  → MIDI 34-46  (Bb1 – Bb2)
+    (27, 38),   # keys 27-38  → MIDI 47-58  (B2  – Bb3)
+    (39, 50),   # keys 39-50  → MIDI 59-70  (B3  – Bb4)
+    (51, 62),   # keys 51-62  → MIDI 71-82  (B4  – Bb5)
+    (63, 75),   # keys 63-75  → MIDI 83-95  (B5  – B6)
+    (76, 88),   # keys 76-88  → MIDI 96-108 (C7  – C8)
+]
+
+_MIDI_OFFSET = 20   # MIDI note = piano_key + _MIDI_OFFSET
 
 
-@dataclass
-class NoteStats:
-    pitch: int
-    name: str
-    count: int
-    avg_velocity: float
-    avg_duration_s: float
+def _group_of(midi_note: int) -> int | None:
+    """Return 0-based group index for midi_note, or None if off-keyboard."""
+    key = midi_note - _MIDI_OFFSET
+    if not (1 <= key <= 88):
+        return None
+    for i, (lo, hi) in enumerate(GROUPS):
+        if lo <= key <= hi:
+            return i
+    return None
 
 
-@dataclass
-class MidiAnalysis:
-    path: Path
-    duration_s: float
-    tempo_bpm: float
-    time_signature: str
-    total_notes: int
-    unique_pitches: int
-    avg_velocity: float
-    pitch_range: tuple[int, int]
-    top_notes: list[NoteStats] = field(default_factory=list)
-
-    def print_report(self) -> None:
-        print(f"\n{'='*48}")
-        print(f"  {self.path.name}")
-        print(f"{'='*48}")
-        print(f"  Duration      : {self.duration_s:.2f}s")
-        print(f"  Tempo         : {self.tempo_bpm:.1f} BPM")
-        print(f"  Time sig      : {self.time_signature}")
-        print(f"  Total notes   : {self.total_notes}")
-        print(f"  Unique pitches: {self.unique_pitches}")
-        print(f"  Avg velocity  : {self.avg_velocity:.1f}")
-        lo, hi = self.pitch_range
-        print(f"  Pitch range   : {pretty_midi.note_number_to_name(lo)} – "
-              f"{pretty_midi.note_number_to_name(hi)} ({lo}–{hi})")
-        if self.top_notes:
-            print(f"\n  Top {len(self.top_notes)} notes:")
-            print(f"  {'Note':<6} {'Count':>6} {'Vel':>6} {'Dur(s)':>8}")
-            print(f"  {'-'*30}")
-            for n in self.top_notes:
-                print(f"  {n.name:<6} {n.count:>6} {n.avg_velocity:>6.1f} {n.avg_duration_s:>8.3f}")
-        print(f"{'='*48}\n")
+def _note_name(midi_note: int) -> str:
+    return pretty_midi.note_number_to_name(midi_note)
 
 
-def analyze(midi_path: str | Path, top_n: int = 5) -> MidiAnalysis:
-    path = Path(midi_path)
-    if not path.exists():
-        raise FileNotFoundError(f"MIDI file not found: {path}")
+def _group_header(g: int) -> str:
+    lo, hi = GROUPS[g]
+    lo_m, hi_m = lo + _MIDI_OFFSET, hi + _MIDI_OFFSET
+    return (f"Group {g + 1}  |  keys {lo:>2}-{hi:<2}"
+            f"  ({_note_name(lo_m)}-{_note_name(hi_m)}, MIDI {lo_m}-{hi_m})")
 
-    pm = pretty_midi.PrettyMIDI(str(path))
-    mid = mido.MidiFile(str(path))
 
-    # Tempo — use first set_tempo message, default 120 BPM
-    tempo_us = 500_000
-    for msg in mid:
-        if msg.type == "set_tempo":
-            tempo_us = msg.tempo
-            break
-    tempo_bpm = 60_000_000 / tempo_us
+# ---------------------------------------------------------------------------
+# Core analysis
+# ---------------------------------------------------------------------------
 
-    # Time signature — use first found, default 4/4
-    ts = "4/4"
-    for msg in mid:
-        if msg.type == "time_signature":
-            ts = f"{msg.numerator}/{msg.denominator}"
-            break
+def build_histograms(midi_path: Path) -> tuple[float, list[dict[int, int]], list[int]]:
+    """
+    Scan a MIDI file at 1 ms resolution and build per-group histograms.
 
-    # Collect all notes across all piano instruments
-    all_notes: list[pretty_midi.Note] = []
+    Returns
+    -------
+    duration_s  : total file duration in seconds
+    histograms  : list of 7 dicts  {simultaneous_note_count: ms_count}
+    note_counts : total notes found per group
+    """
+    print(f"\n  Loading '{midi_path.name}' ...", flush=True)
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    duration_s = pm.get_end_time()
+
+    # Collect (start_ms, end_ms) per group
+    group_intervals: list[list[tuple[int, int]]] = [[] for _ in GROUPS]
+
     for instrument in pm.instruments:
-        if not instrument.is_drum:
-            all_notes.extend(instrument.notes)
+        if instrument.is_drum:
+            continue
+        for note in instrument.notes:
+            g = _group_of(note.pitch)
+            if g is None:
+                continue
+            s_ms = int(note.start * 1000)
+            e_ms = int(note.end   * 1000)
+            if e_ms > s_ms:
+                group_intervals[g].append((s_ms, e_ms))
 
-    if not all_notes:
-        raise ValueError("No notes found in MIDI file.")
+    note_counts = [len(iv) for iv in group_intervals]
 
-    pitches = np.array([n.pitch for n in all_notes])
-    velocities = np.array([n.velocity for n in all_notes])
-    durations = np.array([n.end - n.start for n in all_notes])
+    print(f"  Duration : {duration_s:.2f} s  ({duration_s / 60:.2f} min)")
+    print(f"  Notes    : {sum(note_counts)} total  |  per group: "
+          + "  ".join(f"G{i+1}={n}" for i, n in enumerate(note_counts)))
+    print(f"\n  Building 1 ms histograms for {len(GROUPS)} groups ...", flush=True)
 
-    # Per-pitch statistics
-    note_map: dict[int, list[pretty_midi.Note]] = {}
-    for note in all_notes:
-        note_map.setdefault(note.pitch, []).append(note)
+    histograms: list[dict[int, int]] = []
 
-    top_notes = sorted(note_map.items(), key=lambda kv: len(kv[1]), reverse=True)[:top_n]
-    top_stats = [
-        NoteStats(
-            pitch=p,
-            name=pretty_midi.note_number_to_name(p),
-            count=len(notes),
-            avg_velocity=float(np.mean([n.velocity for n in notes])),
-            avg_duration_s=float(np.mean([n.end - n.start for n in notes])),
-        )
-        for p, notes in top_notes
+    for g, intervals in enumerate(group_intervals):
+        lo, hi = GROUPS[g]
+        lo_m, hi_m = lo + _MIDI_OFFSET, hi + _MIDI_OFFSET
+        print(f"    [{g+1}/7]  keys {lo:>2}-{hi:<2}"
+              f"  ({_note_name(lo_m)}-{_note_name(hi_m)}) ...",
+              end="  ", flush=True)
+
+        # Event sweep: build sorted list of (time_ms, +1/-1)
+        events: list[tuple[int, int]] = []
+        for s_ms, e_ms in intervals:
+            events.append((s_ms, +1))
+            events.append((e_ms, -1))
+        events.sort()
+
+        hist: dict[int, int] = defaultdict(int)
+        active = 0
+        prev_t = 0
+        i = 0
+
+        while i < len(events):
+            t = events[i][0]
+            # Accumulate interval [prev_t, t) at current active count
+            if t > prev_t and active > 0:
+                hist[active] += t - prev_t
+            # Consume all events sharing time t
+            while i < len(events) and events[i][0] == t:
+                active += events[i][1]
+                i += 1
+            prev_t = t
+
+        histograms.append(dict(hist))
+
+        if hist:
+            max_sim = max(hist)
+            active_ms = sum(hist.values())
+            print(f"max simultaneous = {max_sim},  {active_ms} ms active", flush=True)
+        else:
+            print("(no activity)", flush=True)
+
+    return duration_s, histograms, note_counts
+
+
+# ---------------------------------------------------------------------------
+# Report formatting
+# ---------------------------------------------------------------------------
+
+_BAR_WIDTH = 42
+
+
+def _bar(value: int, max_value: int) -> str:
+    if max_value == 0 or value == 0:
+        return ""
+    filled = max(1, round(value / max_value * _BAR_WIDTH))
+    return "#" * filled
+
+
+def format_report(
+    midi_path: Path,
+    duration_s: float,
+    histograms: list[dict[int, int]],
+    note_counts: list[int],
+) -> str:
+    SEP  = "=" * 68
+    DASH = "-" * 68
+    lines: list[str] = []
+
+    lines += [
+        SEP,
+        "  Piano MIDI Group Histogram Analysis",
+        f"  File     : {midi_path.name}",
+        f"  Duration : {duration_s:.2f} s  ({duration_s / 60:.2f} min)",
+        f"  Groups   : {len(GROUPS)}   |   Piano keys 1-88  (MIDI 21-108)",
+        SEP,
     ]
 
-    return MidiAnalysis(
-        path=path,
-        duration_s=pm.get_end_time(),
-        tempo_bpm=tempo_bpm,
-        time_signature=ts,
-        total_notes=len(all_notes),
-        unique_pitches=int(np.unique(pitches).size),
-        avg_velocity=float(velocities.mean()),
-        pitch_range=(int(pitches.min()), int(pitches.max())),
-        top_notes=top_stats,
-    )
+    for g, hist in enumerate(histograms):
+        lo, hi = GROUPS[g]
+        n_keys = hi - lo + 1
+
+        lines.append("")
+        lines.append(_group_header(g) + f"  |  {note_counts[g]} notes")
+        lines.append(DASH)
+
+        if not hist:
+            lines.append("  (no activity)")
+            continue
+
+        max_ms = max(hist.values())
+        lines.append(f"  {'Active':>6} | {'ms count':>9} | Bar  (1 '#' = {max_ms / _BAR_WIDTH:.0f} ms)")
+        lines.append(f"  {'------':>6}-+-{'----------':>9}-+-" + "-" * _BAR_WIDTH)
+
+        for count in range(1, n_keys + 1):
+            ms_val = hist.get(count, 0)
+            bar    = _bar(ms_val, max_ms)
+            lines.append(f"  {count:>6} | {ms_val:>9} | {bar}")
+
+        lines.append(f"  {'------':>6}-+-{'----------':>9}-+-" + "-" * _BAR_WIDTH)
+
+    lines += ["", SEP]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+def analyze_file(midi_path: Path) -> None:
+    if not midi_path.exists():
+        print(f"[ERROR] File not found: {midi_path}", file=sys.stderr)
+        sys.exit(1)
+
+    duration_s, histograms, note_counts = build_histograms(midi_path)
+
+    report = format_report(midi_path, duration_s, histograms, note_counts)
+    print("\n" + report)
+
+    out_path = midi_path.with_suffix(".txt")
+    out_path.write_text(report, encoding="utf-8")
+    print(f"\n  Report saved -> {out_path}\n")
 
 
 def main() -> None:
-    args = sys.argv[1:]
-    if not args:
-        print("Usage: python analyze_midi.py <file.mid> [file2.mid ...]")
-        print("       Drop MIDI files into the midi_files/ folder and run:")
-        print("       python analyze_midi.py ../midi_files/*.mid")
-        sys.exit(0)
-
-    for path in args:
-        try:
-            result = analyze(path)
-            result.print_report()
-        except (FileNotFoundError, ValueError) as e:
-            print(f"[ERROR] {e}", file=sys.stderr)
+    if len(sys.argv) >= 2:
+        for arg in sys.argv[1:]:
+            analyze_file(Path(arg))
+    else:
+        default = Path(__file__).parent.parent / "midi_files" / "elise.mid"
+        print(f"  No file specified — using default: {default}", flush=True)
+        analyze_file(default)
 
 
 if __name__ == "__main__":
