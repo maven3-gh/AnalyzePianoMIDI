@@ -215,14 +215,55 @@ def analyze_file(midi_path: Path) -> None:
     print(f"\n  Report saved -> {out_path}\n")
 
 
+def run_batch(midi_dir: Path) -> None:
+    """Analyze all MIDI files in midi_dir that lack a matching .txt result."""
+    all_midi = sorted(midi_dir.glob("*.mid")) + sorted(midi_dir.glob("*.MID"))
+    pending = [f for f in all_midi if not f.with_suffix(".txt").exists()]
+
+    if not pending:
+        print(f"\n  No pending MIDI files in '{midi_dir}' — all results up to date.\n")
+        return
+
+    total = len(pending)
+    done  = 0
+
+    print(f"\n  Found {total} file(s) to analyze in '{midi_dir}':\n")
+    for f in pending:
+        print(f"    {f.name}")
+    print()
+
+    for idx, midi_path in enumerate(pending, start=1):
+        SEP = "=" * 68
+        print(SEP)
+        print(f"  File {idx}/{total}  |  Session count: {done} analyzed  |  {midi_path.name}")
+        print(SEP)
+
+        analyze_file(midi_path)
+        done += 1
+
+        if idx < total:
+            remaining = total - idx
+            print(f"  {done} file(s) analyzed this session.  {remaining} remaining.")
+            try:
+                answer = input("  Continue to next file? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Stopped.")
+                break
+            if answer in ("n", "no"):
+                print(f"\n  Stopped after {done} file(s). Run again to process the rest.\n")
+                break
+            print()
+
+    print(f"\n  Session complete — {done} of {total} file(s) analyzed.\n")
+
+
 def main() -> None:
     if len(sys.argv) >= 2:
         for arg in sys.argv[1:]:
             analyze_file(Path(arg))
     else:
-        default = Path(__file__).parent.parent / "midi_files" / "elise.mid"
-        print(f"  No file specified — using default: {default}", flush=True)
-        analyze_file(default)
+        midi_dir = Path(__file__).parent.parent / "midi_files"
+        run_batch(midi_dir)
 
 
 if __name__ == "__main__":
