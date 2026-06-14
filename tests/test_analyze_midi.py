@@ -12,7 +12,9 @@ from analyze_midi import (
     GROUPS,
     _MIDI_OFFSET,
     _group_of,
+    _parse_report,
     build_histograms,
+    consolidate,
     format_report,
 )
 
@@ -118,3 +120,67 @@ def test_format_report_runs():
     report = format_report(Path("test.mid"), 2.0, dummy_hist, dummy_counts)
     assert "Group 4" in report
     assert "1000" in report
+
+
+def test_parse_report_roundtrip():
+    """format_report -> _parse_report should recover the same data."""
+    hist = [{} for _ in GROUPS]
+    hist[3] = {1: 1000, 2: 500}
+    note_counts = [0, 0, 0, 10, 0, 0, 0]
+    duration_s = 12.34
+
+    report = format_report(Path("test.mid"), duration_s, hist, note_counts)
+    parsed_duration, parsed_hist, parsed_notes = _parse_report(report)
+
+    assert parsed_duration == pytest.approx(duration_s, abs=0.01)
+    assert parsed_hist[3] == {1: 1000, 2: 500}
+    assert parsed_notes == note_counts
+    for g in range(len(GROUPS)):
+        if g != 3:
+            assert parsed_hist[g] == {}
+
+
+def test_consolidate(tmp_path):
+    """consolidate() should sum histograms/notes and list source files."""
+    hist1 = [{} for _ in GROUPS]
+    hist1[3] = {1: 1000}
+    report1 = format_report(Path("file1.mid"), 10.0, hist1, [0, 0, 0, 5, 0, 0, 0])
+    (tmp_path / "file1.txt").write_text(report1, encoding="utf-8")
+
+    hist2 = [{} for _ in GROUPS]
+    hist2[3] = {1: 500, 2: 200}
+    report2 = format_report(Path("file2.mid"), 5.0, hist2, [0, 0, 0, 8, 0, 0, 0])
+    (tmp_path / "file2.txt").write_text(report2, encoding="utf-8")
+
+    consolidate(tmp_path)
+
+    out_path = tmp_path / "consolidate.txt"
+    assert out_path.exists()
+    out = out_path.read_text(encoding="utf-8")
+
+    assert "file1.txt" in out
+    assert "file2.txt" in out
+    assert "13 notes" in out          # 5 + 8 combined notes for group 4
+    assert "1500" in out              # combined count=1 ms (1000 + 500)
+    assert "Total: 2 file(s), 1700 samples" in out  # 1000+500+200
+
+
+def test_consolidate_overwrites(tmp_path):
+    """Re-running consolidate() should overwrite consolidate.txt, not duplicate."""
+    hist = [{} for _ in GROUPS]
+    hist[0] = {1: 100}
+    report = format_report(Path("a.mid"), 1.0, hist, [3, 0, 0, 0, 0, 0, 0])
+    (tmp_path / "a.txt").write_text(report, encoding="utf-8")
+
+    consolidate(tmp_path)
+    consolidate(tmp_path)  # second run must not include consolidate.txt as a source
+
+    out = (tmp_path / "consolidate.txt").read_text(encoding="utf-8")
+    assert "consolidate.txt" not in out
+    assert "Total: 1 file(s), 100 samples" in out
+
+
+def test_consolidate_no_results(tmp_path):
+    """consolidate() with no .txt files should not create consolidate.txt."""
+    consolidate(tmp_path)
+    assert not (tmp_path / "consolidate.txt").exists()

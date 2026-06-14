@@ -7,6 +7,7 @@ simultaneously.
 
 from __future__ import annotations
 
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -197,6 +198,92 @@ def format_report(
 
 
 # ---------------------------------------------------------------------------
+# Consolidation
+# ---------------------------------------------------------------------------
+
+_DURATION_RE     = re.compile(r"Duration\s*:\s*([\d.]+)\s*s")
+_GROUP_HEADER_RE = re.compile(r"^Group (\d+)\s+\|.*\|\s*(\d+) notes")
+_DATA_ROW_RE     = re.compile(r"^\s*(\d+)\s*\|\s*(\d+)\s*\|")
+
+
+def _parse_report(text: str) -> tuple[float, list[dict[int, int]], list[int]]:
+    """Parse a previously written report back into histogram data."""
+    duration_s = 0.0
+    histograms: list[dict[int, int]] = [dict() for _ in GROUPS]
+    note_counts: list[int] = [0] * len(GROUPS)
+    current_group: int | None = None
+
+    for line in text.splitlines():
+        m = _DURATION_RE.search(line)
+        if m and duration_s == 0.0:
+            duration_s = float(m.group(1))
+            continue
+
+        m = _GROUP_HEADER_RE.match(line)
+        if m:
+            current_group = int(m.group(1)) - 1
+            note_counts[current_group] = int(m.group(2))
+            continue
+
+        if current_group is not None:
+            m = _DATA_ROW_RE.match(line)
+            if m:
+                active, ms_val = int(m.group(1)), int(m.group(2))
+                if ms_val:
+                    histograms[current_group][active] = (
+                        histograms[current_group].get(active, 0) + ms_val
+                    )
+
+    return duration_s, histograms, note_counts
+
+
+def consolidate(midi_dir: Path) -> None:
+    """Combine every .txt result in midi_dir into consolidate.txt."""
+    out_path = midi_dir / "consolidate.txt"
+    txt_files = sorted(
+        f for f in midi_dir.glob("*.txt") if f.name.lower() != "consolidate.txt"
+    )
+
+    if not txt_files:
+        print(f"\n  No .txt result files found in '{midi_dir}' — skipping consolidation.\n")
+        return
+
+    print(f"\n  Consolidating {len(txt_files)} result file(s) -> {out_path.name} ...", flush=True)
+
+    combined_hist: list[dict[int, int]] = [dict() for _ in GROUPS]
+    combined_notes: list[int] = [0] * len(GROUPS)
+    total_duration = 0.0
+    sources: list[tuple[str, int]] = []
+
+    for f in txt_files:
+        duration_s, histograms, note_counts = _parse_report(f.read_text(encoding="utf-8"))
+        total_duration += duration_s
+
+        samples = 0
+        for g, hist in enumerate(histograms):
+            combined_notes[g] += note_counts[g]
+            for active, ms_val in hist.items():
+                combined_hist[g][active] = combined_hist[g].get(active, 0) + ms_val
+                samples += ms_val
+
+        sources.append((f.name, samples))
+        print(f"    + {f.name}  ({samples} samples)", flush=True)
+
+    report = format_report(Path("ALL FILES (consolidated)"), total_duration, combined_hist, combined_notes)
+
+    lines = [report, "", "Source files", "-" * 68]
+    name_width = max(len(name) for name, _ in sources)
+    for name, samples in sources:
+        lines.append(f"  {name:<{name_width}}  {samples:>10} samples")
+    lines.append("-" * 68)
+    lines.append(f"  Total: {len(sources)} file(s), {sum(s for _, s in sources)} samples")
+    lines += ["", "=" * 68]
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"  Consolidated report saved -> {out_path}\n")
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -222,45 +309,48 @@ def run_batch(midi_dir: Path) -> None:
 
     if not pending:
         print(f"\n  No pending MIDI files in '{midi_dir}' — all results up to date.\n")
-        return
+    else:
+        total = len(pending)
+        done  = 0
 
-    total = len(pending)
-    done  = 0
+        print(f"\n  Found {total} file(s) to analyze in '{midi_dir}':\n")
+        for f in pending:
+            print(f"    {f.name}")
+        print()
 
-    print(f"\n  Found {total} file(s) to analyze in '{midi_dir}':\n")
-    for f in pending:
-        print(f"    {f.name}")
-    print()
+        for idx, midi_path in enumerate(pending, start=1):
+            SEP = "=" * 68
+            print(SEP)
+            print(f"  File {idx}/{total}  |  Session count: {done} analyzed  |  {midi_path.name}")
+            print(SEP)
 
-    for idx, midi_path in enumerate(pending, start=1):
-        SEP = "=" * 68
-        print(SEP)
-        print(f"  File {idx}/{total}  |  Session count: {done} analyzed  |  {midi_path.name}")
-        print(SEP)
+            analyze_file(midi_path)
+            done += 1
 
-        analyze_file(midi_path)
-        done += 1
+            if idx < total:
+                remaining = total - idx
+                print(f"  {done} file(s) analyzed this session.  {remaining} remaining.")
+                try:
+                    answer = input("  Continue to next file? [Y/n]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  Stopped.")
+                    break
+                if answer in ("n", "no"):
+                    print(f"\n  Stopped after {done} file(s). Run again to process the rest.\n")
+                    break
+                print()
 
-        if idx < total:
-            remaining = total - idx
-            print(f"  {done} file(s) analyzed this session.  {remaining} remaining.")
-            try:
-                answer = input("  Continue to next file? [Y/n]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\n  Stopped.")
-                break
-            if answer in ("n", "no"):
-                print(f"\n  Stopped after {done} file(s). Run again to process the rest.\n")
-                break
-            print()
+        print(f"\n  Session complete — {done} of {total} file(s) analyzed.\n")
 
-    print(f"\n  Session complete — {done} of {total} file(s) analyzed.\n")
+    consolidate(midi_dir)
 
 
 def main() -> None:
     if len(sys.argv) >= 2:
+        midi_dir = Path(sys.argv[1]).resolve().parent
         for arg in sys.argv[1:]:
             analyze_file(Path(arg))
+        consolidate(midi_dir)
     else:
         midi_dir = Path(__file__).parent.parent / "midi_files"
         run_batch(midi_dir)
